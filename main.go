@@ -2,6 +2,7 @@ package main
 
 import (
 	"encoding/csv"
+	"flag"
 	"fmt"
 	"log"
 	"os"
@@ -143,15 +144,24 @@ func exportFile(output [][]string) error {
 }
 
 func main() {
+	var ipaddr, uname, passw, ldType string
+	flag.StringVar(&uname, "u", "admin", "Specify the username. Default is admin.")
+	flag.StringVar(&passw, "p", "***", "Specify the password.")
+	flag.StringVar(&ipaddr, "i", "127.0.0.1", "Specify NFM-T IP Address. Default is 127.0.0.1.")
+	flag.StringVar(&ldType, "l", "RA2P", "Specify The LD type. Default is RA2P.")
+	flag.Usage = func() {
+		fmt.Printf("Usage: \n")
+		fmt.Printf("./otsloss.exe -n admin -p password -i 192.168.0.1 -l RA2P \n")
+	}
+	flag.Parse()
+
 	var wg1 sync.WaitGroup
 	var wg2 sync.WaitGroup
-	ipaddr := "1.1.1.1"
-	uname := "admin"
-	passw := "ppp"
+
 	restAgent := Init(ipaddr, uname, passw)
 	defer restAgent.NfmtDeauth()
 
-	otsList := GetRamanConnections(restAgent, "ASWG")
+	otsList := GetRamanConnections(restAgent, ldType)
 
 	nxPm := nxPmConList(restAgent)
 	masterfile := []map[string]interface{}{}
@@ -168,8 +178,10 @@ func main() {
 			cores := []map[string]interface{}{}
 			pmData, ok := getPortPower(restAgent, []string{fmt.Sprintf("%v", ots["z2PortLabel"]), fmt.Sprintf("%v", ots["zPortLabel"])}, fmt.Sprintf("%v", otsPmId["cxnId"]))
 			if !ok {
+				wg2.Done()
 				return
 			}
+			fmt.Println("Returned!!!!!!!!!1")
 			for _, core := range chars {
 				wg1.Add(1)
 				go func(core map[string]interface{}) {
@@ -204,6 +216,7 @@ func main() {
 		}
 	}
 	if len(output) == 1 {
+		restAgent.NfmtDeauth()
 		log.Fatalf("error - no PM Data has been collected!")
 	} else {
 		err := exportFile(output)
@@ -213,4 +226,5 @@ func main() {
 			panic(err)
 		}
 	}
+
 }
