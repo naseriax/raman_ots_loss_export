@@ -12,11 +12,6 @@ import (
 	"time"
 )
 
-type nxPm struct {
-	NoOfEntries int `json:"noOfEntries"`
-	StartIndex  int `json:"startIndex"`
-}
-
 func getFiberChar(agent RestAgent, ots map[string]interface{}) []map[string]interface{} {
 	log.Printf("Retrieving the Fiber Characteristics for OTS: %v\n", fmt.Sprintf("%v", ots["guiLabel"]))
 	resp := agent.HttpGet(fmt.Sprintf("/data/npr/physicalConns/%v/fiberCharacteristic", fmt.Sprintf("%v", ots["id"])), map[string]string{})
@@ -40,9 +35,9 @@ func GetRamanConnections(agent RestAgent, ldType string) []map[string]interface{
 
 func nxPmConList(agent RestAgent) []map[string]interface{} {
 	url := "/mncpm/mdcxnlist/"
-	payload := &nxPm{
-		NoOfEntries: 10000,
-		StartIndex:  0,
+	payload := map[string]int{
+		"noOfEntries": 10000,
+		"startIndex":  0,
 	}
 	nxPmRawData := agent.HttpPostJson(url, payload, map[string]string{})
 	_, nxPmJsonData := GeneralJsonDecoder(nxPmRawData)
@@ -181,7 +176,6 @@ func main() {
 				wg2.Done()
 				return
 			}
-			fmt.Println("Returned!!!!!!!!!1")
 			for _, core := range chars {
 				wg1.Add(1)
 				go func(core map[string]interface{}) {
