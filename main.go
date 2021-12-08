@@ -1,5 +1,17 @@
 package main
 
+/* This script is used to calculate optical fiber loss values from a more
+prefered point in case desired.The loss values can be retrieved from Nokia NFM-T's UI :
+	Operate > Physical Connections > OTS 360 View > Fiber Characteristics.
+
+Firstly, This manual calculation through NFM-T's Rest API is useful in case we want to get
+the current loss values for all/many OTS connections in one shot which is not possible via NFM-T's UI.
+
+Secondly, Some operators may prefer to use the Raman card's Linein power instead
+of the LD's Linein to calculate the loss and that's how this script calculates the
+loss for the fiber's configured with Raman Amplifiers (RA2P).
+*/
+
 import (
 	"encoding/csv"
 	"encoding/json"
@@ -13,13 +25,16 @@ import (
 	"time"
 )
 
+//fiberCore includes the required fields from NFM-T's Fiber Characteristics' json response.
 type fiberCore struct {
 	FromLabel      string `json:"fromLabel"`
 	ToLabel        string `json:"toLabel"`
 	EgressPowerOut string `json:"egressPowerOut"`
+	IngressPowerIn string `json:"ingressPowerIn"`
 	RamanGain      string `json:"targetGainStr"`
 }
 
+//otsCon includes the required fields from NFM-T's physical connections' json response.
 type otsCon struct {
 	APortLabel        string `json:"aPortLabel"`
 	ZPortLabel        string `json:"zPortLabel"`
@@ -30,6 +45,7 @@ type otsCon struct {
 	Id                int    `json:"id"`
 }
 
+//pmStruct includes the required fields from NFM-T's NextGen PM query for the OTS connection.
 type pmStruct struct {
 	ObjGraphDataMap []struct {
 		GraphDataMap struct {
@@ -40,6 +56,7 @@ type pmStruct struct {
 	} `json:"objGraphDataMap"`
 }
 
+//GetRamanConnections fills the []otsCon struct with the OTS connections having the specified ldType.
 func GetRamanConnections(agent RestAgent, ldType string) []otsCon {
 	rawOtsData := agent.HttpGet("/data/npr/physicalConns", map[string]string{})
 	var listJson []otsCon
@@ -55,6 +72,7 @@ func GetRamanConnections(agent RestAgent, ldType string) []otsCon {
 	return otslist
 }
 
+//getFiberChar fills the []fiberCore struct with the Fiber Characteristics information for the provided OTS.
 func getFiberChar(agent RestAgent, ots otsCon) []fiberCore {
 	log.Printf("Retrieving the Fiber Characteristics for OTS: %v\n", fmt.Sprintf("%v", ots.GuiLabel))
 	resp := agent.HttpGet(fmt.Sprintf("/data/npr/physicalConns/%v/fiberCharacteristic", fmt.Sprintf("%v", ots.Id)), map[string]string{})
@@ -63,6 +81,7 @@ func getFiberChar(agent RestAgent, ots otsCon) []fiberCore {
 	return fiberCharInfo
 }
 
+//nxPmConList returns the connections' names managed under Next-Gen PM application in NFM-T.
 func nxPmConList(agent RestAgent) []map[string]interface{} {
 	url := "/mncpm/mdcxnlist/"
 	payload := map[string]int{
@@ -75,11 +94,13 @@ func nxPmConList(agent RestAgent) []map[string]interface{} {
 	return nxPmJsonData
 }
 
+//timeCalculator Provides current time in Epoch format to be used for PM Query payload construction.
 func timeCalculator() [2]int {
 	ts := time.Now().Unix()
 	return [2]int{int(ts), int(ts) - 3600}
 }
 
+//getPortPower returns the Performance Data for the specified []portInfo.
 func getPortPower(agent RestAgent, portInfo []string, otsPmId string) map[string]interface{} {
 	log.Printf("Retrieving the RX Power on %v\n", portInfo[0])
 	log.Printf("Retrieving the RX Power on %v\n", portInfo[1])
@@ -153,6 +174,7 @@ func getPortPower(agent RestAgent, portInfo []string, otsPmId string) map[string
 	return pmInfo
 }
 
+//exportFile exportes the calculated values to CSV.
 func exportFile(output [][]string) error {
 	ts := fmt.Sprintf("%v", timeCalculator()[0])
 	csvFile, err := os.Create(fmt.Sprintf("output_%v.csv", ts))
@@ -168,32 +190,73 @@ func exportFile(output [][]string) error {
 	return nil
 }
 
+//coreLossCalculator calculates the loss info for the specified core.
+func coreLossCalculator(pmData map[string]interface{}, ldType string, core fiberCore) map[string]interface{} {
+	var corePowerData map[string]interface{}
+	if strings.Contains("RA2P", ldType) {
+		corePowerData = map[string]interface{}{
+			"egressPort":   core.FromLabel,
+			"ingressPort":  core.ToLabel,
+			"egressPower":  core.EgressPowerOut,
+			"ingressPower": pmData[fmt.Sprintf("%v", core.ToLabel)],
+			"ramanGain":    core.RamanGain,
+			"totalLoss":    0}
+	} else {
+		corePowerData = map[string]interface{}{
+			"egressPort":   core.FromLabel,
+			"ingressPort":  core.ToLabel,
+			"egressPower":  core.EgressPowerOut,
+			"ingressPower": core.IngressPowerIn,
+			"ramanGain":    core.RamanGain,
+			"totalLoss":    0,
+		}
+	}
+	egPower, err := strconv.ParseFloat(fmt.Sprintf("%v", corePowerData["egressPower"]), 64)
+	errDealer(err)
+	inPower, err := strconv.ParseFloat(fmt.Sprintf("%v", corePowerData["ingressPower"]), 64)
+	errDealer(err)
+
+	if corePowerData["ramanGain"] != "N.A." {
+		ramanGain, err := strconv.ParseFloat(fmt.Sprintf("%v", corePowerData["ramanGain"]), 64)
+		errDealer(err)
+		corePowerData["totalLoss"] = ((egPower - inPower + ramanGain) * 1000) / 1000
+	} else {
+		corePowerData["totalLoss"] = ((egPower - inPower) * 1000) / 1000
+	}
+	return corePowerData
+}
+
 func main() {
 	var ipaddr, uname, passw, ldType string
 	flag.StringVar(&uname, "u", "admin", "Specify the username. Default is admin.")
-	flag.StringVar(&passw, "p", "***", "Specify the password.")
+	flag.StringVar(&passw, "p", "", "Specify the password.")
 	flag.StringVar(&ipaddr, "i", "127.0.0.1", "Specify NFM-T IP Address. Default is 127.0.0.1.")
 	flag.StringVar(&ldType, "l", "RA2P", "Specify The LD type. Default is RA2P.")
 	flag.Usage = func() {
 		fmt.Printf("Usage: \n")
-		fmt.Printf("./otsloss.exe -n admin -p password -i 192.168.0.1 -l RA2P \n")
+		fmt.Printf("./otsloss.exe -u admin -p password -i 192.168.0.1 -l RA2P \n")
 	}
 	flag.Parse()
 
-	var wg1 sync.WaitGroup
-	var wg2 sync.WaitGroup
+	var mainWG sync.WaitGroup
+	var subWG sync.WaitGroup
 
+	//masterfile will collect all the calculated values and will be used to generate the output file.
 	masterfile := []map[string]interface{}{}
 
+	//restAgent will open a Rest Session towards NFM-T and will be used for any Get/Post queries.
 	restAgent := Init(ipaddr, uname, passw)
 	defer restAgent.NfmtDeauth()
 
+	//otsList Contains the otsCon struct for every OTS connection which has the specified ldType.
 	otsList := GetRamanConnections(restAgent, ldType)
 
+	//nxPm has all the connections listed in Next-Gen PM application in NFM-T.
 	nxPm := nxPmConList(restAgent)
 
+	//For each OTS connection in otsList, we query the fiber characteristics and PM info(1 operation for each core of the OTS).
 	for _, ots := range otsList {
-		wg2.Add(1)
+		mainWG.Add(1)
 		go func(ots otsCon) {
 			var otsPmId map[string]interface{}
 			for _, item := range nxPm {
@@ -202,43 +265,57 @@ func main() {
 				}
 			}
 			chars := getFiberChar(restAgent, ots)
-			cores := []map[string]interface{}{}
-			pmData := getPortPower(restAgent, []string{fmt.Sprintf("%v", ots.Z2PortLabel), fmt.Sprintf("%v", ots.ZPortLabel)}, fmt.Sprintf("%v", otsPmId["cxnId"]))
+			pmData := getPortPower(
+				restAgent,
+				[]string{
+					fmt.Sprintf("%v", ots.Z2PortLabel),
+					fmt.Sprintf("%v", ots.ZPortLabel)},
+				fmt.Sprintf("%v", otsPmId["cxnId"]),
+			)
 			if pmData == nil {
-				wg2.Done()
+				mainWG.Done()
 				return
 			}
-			for _, core := range chars {
-				wg1.Add(1)
-				go func(core fiberCore) {
-					corePowerData := map[string]interface{}{"egressPort": core.FromLabel, "ingressPort": core.ToLabel, "egressPower": core.EgressPowerOut, "ingressPower": pmData[fmt.Sprintf("%v", core.ToLabel)], "ramanGain": core.RamanGain, "totalLoss": 0}
-					egPower, err := strconv.ParseFloat(fmt.Sprintf("%v", corePowerData["egressPower"]), 64)
-					errDealer(err)
-					inPower, err := strconv.ParseFloat(fmt.Sprintf("%v", corePowerData["ingressPower"]), 64)
-					errDealer(err)
-					if corePowerData["ramanGain"] != "N.A." {
-						ramanGain, err := strconv.ParseFloat(fmt.Sprintf("%v", corePowerData["ramanGain"]), 64)
-						errDealer(err)
-						corePowerData["totalLoss"] = ((egPower - inPower + ramanGain) * 1000) / 1000
-					} else {
-						corePowerData["totalLoss"] = ((egPower - inPower) * 1000) / 1000
-					}
-					cores = append(cores, corePowerData)
+			var cores []map[string]interface{}
 
-					wg1.Done()
+			for _, core := range chars {
+				subWG.Add(1)
+				go func(core fiberCore) {
+					corePowerData := coreLossCalculator(pmData, ldType, core)
+					cores = append(cores, corePowerData)
+					subWG.Done()
 				}(core)
 			}
-			wg1.Wait()
+			subWG.Wait()
 			masterfile = append(masterfile, map[string]interface{}{"ots": ots, "cores": cores})
-			wg2.Done()
+			mainWG.Done()
 		}(ots)
+
 	}
-	wg2.Wait()
-	output := [][]string{{"OTS Name", "Egress Port", "Egress Power", "Ingress Port", "Ingress Power", "Raman Gain", "Total Loss"}}
+	mainWG.Wait()
+	output := [][]string{
+		{
+			"OTS Name",
+			"Egress Port",
+			"Egress Power",
+			"Ingress Port",
+			"Ingress Power",
+			"Raman Gain",
+			"Total Loss",
+		},
+	}
 	for _, res := range masterfile {
 		index := fmt.Sprintf("%v", res["ots"].(otsCon).GuiLabel)
 		for _, co := range res["cores"].([]map[string]interface{}) {
-			rowToAdd := []string{index, fmt.Sprintf("%v", co["egressPort"]), fmt.Sprintf("%v", co["egressPower"]), fmt.Sprintf("%v", co["ingressPort"]), fmt.Sprintf("%v", co["ingressPower"]), fmt.Sprintf("%v", co["ramanGain"]), fmt.Sprintf("%v", co["totalLoss"])}
+			rowToAdd := []string{
+				index,
+				fmt.Sprintf("%v", co["egressPort"]),
+				fmt.Sprintf("%v", co["egressPower"]),
+				fmt.Sprintf("%v", co["ingressPort"]),
+				fmt.Sprintf("%v", co["ingressPower"]),
+				fmt.Sprintf("%v", co["ramanGain"]),
+				fmt.Sprintf("%v", co["totalLoss"]),
+			}
 			output = append(output, rowToAdd)
 		}
 	}
