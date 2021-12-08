@@ -34,6 +34,11 @@ type fiberCore struct {
 	RamanGain      string `json:"targetGainStr"`
 }
 
+type nxPmData struct {
+	CxnName string `json:"cxnName"`
+	CxnId   string `json:"cxnId"`
+}
+
 //otsCon includes the required fields from NFM-T's physical connections' json response.
 type otsCon struct {
 	APortLabel        string `json:"aPortLabel"`
@@ -82,14 +87,14 @@ func getFiberChar(agent RestAgent, ots otsCon) []fiberCore {
 }
 
 //nxPmConList returns the connections' names managed under Next-Gen PM application in NFM-T.
-func nxPmConList(agent RestAgent) []map[string]interface{} {
+func nxPmConList(agent RestAgent) []nxPmData {
 	url := "/mncpm/mdcxnlist/"
 	payload := map[string]int{
 		"noOfEntries": 10000,
 		"startIndex":  0,
 	}
 	nxPmRawData := agent.HttpPostJson(url, payload, map[string]string{})
-	var nxPmJsonData []map[string]interface{}
+	var nxPmJsonData []nxPmData
 	json.Unmarshal([]byte(nxPmRawData), &nxPmJsonData)
 	return nxPmJsonData
 }
@@ -128,38 +133,25 @@ func getPortPower(agent RestAgent, portInfo []string, otsPmId string) map[string
 	for _, port := range portInfo {
 		t := map[string]string{}
 		for _, data := range pmData {
-			if val, ok := data[port]; ok {
-				if val == "" {
-					continue
+			var dataContainer, val interface{}
+			if v, ok := data[port]; ok {
+				dataContainer = data[port]
+				val = v
+			} else if v, ok := data[port+"(Z End)"]; ok {
+				dataContainer = data[port+"(Z End)"]
+				val = v
+			}
+			if val != "" {
+				if len(t) == 0 {
+					t[port] = fmt.Sprintf("%v", dataContainer)
+					t["Time"] = fmt.Sprintf("%v", data["Time"])
 				} else {
-					if len(t) == 0 {
-						t[port] = fmt.Sprintf("%v", data[port])
+					layout := "01/02/2006 15:04"
+					t1, _ := time.Parse(layout, t["Time"])
+					t2, _ := time.Parse(layout, fmt.Sprintf("%v", data["Time"]))
+					if t1.Unix() < t2.Unix() {
+						t[port] = fmt.Sprintf("%v", dataContainer)
 						t["Time"] = fmt.Sprintf("%v", data["Time"])
-					} else {
-						layout := "01/02/2006 15:04"
-						t1, _ := time.Parse(layout, t["Time"])
-						t2, _ := time.Parse(layout, fmt.Sprintf("%v", data["Time"]))
-						if t1.Unix() < t2.Unix() {
-							t[port] = fmt.Sprintf("%v", data[port])
-							t["Time"] = fmt.Sprintf("%v", data["Time"])
-						}
-					}
-				}
-			} else if val, ok := data[port+"(Z End)"]; ok {
-				if val == "" {
-					continue
-				} else {
-					if len(t) == 0 {
-						t[port] = fmt.Sprintf("%v", data[port+"(Z End)"])
-						t["Time"] = fmt.Sprintf("%v", data["Time"])
-					} else {
-						layout := "01/02/2006 15:04"
-						t1, _ := time.Parse(layout, t["Time"])
-						t2, _ := time.Parse(layout, fmt.Sprintf("%v", data["Time"]))
-						if t1.Unix() < t2.Unix() {
-							t[port] = fmt.Sprintf("%v", data[port+"(Z End)"])
-							t["Time"] = fmt.Sprintf("%v", data["Time"])
-						}
 					}
 				}
 			}
@@ -191,26 +183,38 @@ func exportFile(output [][]string) error {
 }
 
 //coreLossCalculator calculates the loss info for the specified core.
-func coreLossCalculator(pmData map[string]interface{}, ldType string, core fiberCore) map[string]interface{} {
-	var corePowerData map[string]interface{}
-	if strings.Contains("RA2P", ldType) {
-		corePowerData = map[string]interface{}{
-			"egressPort":   core.FromLabel,
-			"ingressPort":  core.ToLabel,
-			"egressPower":  core.EgressPowerOut,
-			"ingressPower": pmData[fmt.Sprintf("%v", core.ToLabel)],
-			"ramanGain":    core.RamanGain,
-			"totalLoss":    0}
-	} else {
-		corePowerData = map[string]interface{}{
-			"egressPort":   core.FromLabel,
-			"ingressPort":  core.ToLabel,
-			"egressPower":  core.EgressPowerOut,
-			"ingressPower": core.IngressPowerIn,
-			"ramanGain":    core.RamanGain,
-			"totalLoss":    0,
+func coreLossCalculator(restAgent RestAgent, ots otsCon, ldType string, core fiberCore) map[string]interface{} {
+	//nxPm has all the connections listed in Next-Gen PM application in NFM-T.
+	nxPm := nxPmConList(restAgent)
+	var otsPmId nxPmData
+	for _, item := range nxPm {
+		if item.CxnName == ots.GuiLabel {
+			otsPmId = item
 		}
 	}
+	pmData := getPortPower(
+		restAgent,
+		[]string{
+			fmt.Sprintf("%v", ots.Z2PortLabel),
+			fmt.Sprintf("%v", ots.ZPortLabel)},
+		fmt.Sprintf("%v", otsPmId.CxnId),
+	)
+	if pmData == nil {
+		return nil
+	}
+	corePowerData := map[string]interface{}{
+		"egressPort":  core.FromLabel,
+		"ingressPort": core.ToLabel,
+		"egressPower": core.EgressPowerOut,
+		"ramanGain":   core.RamanGain,
+		"totalLoss":   0,
+	}
+	if strings.Contains("RA2P", ldType) {
+		corePowerData["ingressPower"] = pmData[fmt.Sprintf("%v", core.ToLabel)]
+	} else {
+		corePowerData["ingressPower"] = core.IngressPowerIn
+	}
+
 	egPower, err := strconv.ParseFloat(fmt.Sprintf("%v", corePowerData["egressPower"]), 64)
 	errDealer(err)
 	inPower, err := strconv.ParseFloat(fmt.Sprintf("%v", corePowerData["ingressPower"]), 64)
@@ -219,10 +223,11 @@ func coreLossCalculator(pmData map[string]interface{}, ldType string, core fiber
 	if corePowerData["ramanGain"] != "N.A." {
 		ramanGain, err := strconv.ParseFloat(fmt.Sprintf("%v", corePowerData["ramanGain"]), 64)
 		errDealer(err)
-		corePowerData["totalLoss"] = ((egPower - inPower + ramanGain) * 1000) / 1000
+		corePowerData["totalLoss"] = (egPower - inPower + ramanGain) * 1000 / 1000
 	} else {
-		corePowerData["totalLoss"] = ((egPower - inPower) * 1000) / 1000
+		corePowerData["totalLoss"] = (egPower - inPower) * 1000 / 1000
 	}
+
 	return corePowerData
 }
 
@@ -251,37 +256,20 @@ func main() {
 	//otsList Contains the otsCon struct for every OTS connection which has the specified ldType.
 	otsList := GetRamanConnections(restAgent, ldType)
 
-	//nxPm has all the connections listed in Next-Gen PM application in NFM-T.
-	nxPm := nxPmConList(restAgent)
-
 	//For each OTS connection in otsList, we query the fiber characteristics and PM info(1 operation for each core of the OTS).
 	for _, ots := range otsList {
 		mainWG.Add(1)
 		go func(ots otsCon) {
-			var otsPmId map[string]interface{}
-			for _, item := range nxPm {
-				if item["cxnName"] == ots.GuiLabel {
-					otsPmId = item
-				}
-			}
 			chars := getFiberChar(restAgent, ots)
-			pmData := getPortPower(
-				restAgent,
-				[]string{
-					fmt.Sprintf("%v", ots.Z2PortLabel),
-					fmt.Sprintf("%v", ots.ZPortLabel)},
-				fmt.Sprintf("%v", otsPmId["cxnId"]),
-			)
-			if pmData == nil {
-				mainWG.Done()
-				return
-			}
 			var cores []map[string]interface{}
-
 			for _, core := range chars {
 				subWG.Add(1)
 				go func(core fiberCore) {
-					corePowerData := coreLossCalculator(pmData, ldType, core)
+					corePowerData := coreLossCalculator(restAgent, ots, ldType, core)
+					if corePowerData == nil {
+						subWG.Done()
+						return
+					}
 					cores = append(cores, corePowerData)
 					subWG.Done()
 				}(core)
@@ -290,7 +278,6 @@ func main() {
 			masterfile = append(masterfile, map[string]interface{}{"ots": ots, "cores": cores})
 			mainWG.Done()
 		}(ots)
-
 	}
 	mainWG.Wait()
 	output := [][]string{
