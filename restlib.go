@@ -148,19 +148,6 @@ func HttpClientCreator() *http.Client {
 	return &http.Client{Transport: customTr}
 }
 
-func GeneralJsonDecoder(content string) (map[string]interface{}, []map[string]interface{}) {
-	if string(content[0]) == "[" {
-		var result []map[string]interface{}
-		json.Unmarshal([]byte(content), &result)
-		return nil, result
-
-	} else {
-		var result map[string]interface{}
-		json.Unmarshal([]byte(content), &result)
-		return result, nil
-	}
-}
-
 func Init(ipaddr, uname, passw string) RestAgent {
 	token := RestAgent{
 		Httpclient: HttpClientCreator(),

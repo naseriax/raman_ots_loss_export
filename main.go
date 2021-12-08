@@ -2,6 +2,7 @@ package main
 
 import (
 	"encoding/csv"
+	"encoding/json"
 	"flag"
 	"fmt"
 	"log"
@@ -12,25 +13,54 @@ import (
 	"time"
 )
 
-func getFiberChar(agent RestAgent, ots map[string]interface{}) []map[string]interface{} {
-	log.Printf("Retrieving the Fiber Characteristics for OTS: %v\n", fmt.Sprintf("%v", ots["guiLabel"]))
-	resp := agent.HttpGet(fmt.Sprintf("/data/npr/physicalConns/%v/fiberCharacteristic", fmt.Sprintf("%v", ots["id"])), map[string]string{})
-	_, fiberCharInfo := GeneralJsonDecoder(resp)
-	return fiberCharInfo
+type fiberCore struct {
+	FromLabel      string `json:"fromLabel"`
+	ToLabel        string `json:"toLabel"`
+	EgressPowerOut string `json:"egressPowerOut"`
+	RamanGain      string `json:"targetGainStr"`
 }
 
-func GetRamanConnections(agent RestAgent, ldType string) []map[string]interface{} {
+type otsCon struct {
+	APortLabel        string `json:"aPortLabel"`
+	ZPortLabel        string `json:"zPortLabel"`
+	A2PortLabel       string `json:"a2PortLabel"`
+	Z2PortLabel       string `json:"z2PortLabel"`
+	WdmConnectionType string `json:"wdmConnectionType"`
+	GuiLabel          string `json:"guiLabel"`
+	Id                int    `json:"id"`
+}
+
+type pmStruct struct {
+	ObjGraphDataMap []struct {
+		GraphDataMap struct {
+			OPINTOPRAVGReceiveNEND struct {
+				Pmdata []map[string]interface{} `json:"pmdata"`
+			} `json:"OPIN/TOPR-AVG (Receive/NEND)"`
+		} `json:"graphDataMap"`
+	} `json:"objGraphDataMap"`
+}
+
+func GetRamanConnections(agent RestAgent, ldType string) []otsCon {
 	rawOtsData := agent.HttpGet("/data/npr/physicalConns", map[string]string{})
-	_, listJson := GeneralJsonDecoder(rawOtsData)
-	var otslist []map[string]interface{}
+	var listJson []otsCon
+	json.Unmarshal([]byte(rawOtsData), &listJson)
+	var otslist []otsCon
 	for _, phycon := range listJson {
-		if phycon["wdmConnectionType"] == "WdmPortType_ots" {
-			if strings.Contains(fmt.Sprintf("%v", phycon["aPortLabel"]), ldType) || strings.Contains(fmt.Sprintf("%v", phycon["zPortLabel"]), ldType) || strings.Contains(fmt.Sprintf("%v", phycon["a2PortLabel"]), ldType) || strings.Contains(fmt.Sprintf("%v", phycon["z2PortLabel"]), ldType) {
+		if phycon.WdmConnectionType == "WdmPortType_ots" {
+			if strings.Contains(fmt.Sprintf("%v", phycon.APortLabel), ldType) || strings.Contains(fmt.Sprintf("%v", phycon.ZPortLabel), ldType) || strings.Contains(fmt.Sprintf("%v", phycon.A2PortLabel), ldType) || strings.Contains(fmt.Sprintf("%v", phycon.Z2PortLabel), ldType) {
 				otslist = append(otslist, phycon)
 			}
 		}
 	}
 	return otslist
+}
+
+func getFiberChar(agent RestAgent, ots otsCon) []fiberCore {
+	log.Printf("Retrieving the Fiber Characteristics for OTS: %v\n", fmt.Sprintf("%v", ots.GuiLabel))
+	resp := agent.HttpGet(fmt.Sprintf("/data/npr/physicalConns/%v/fiberCharacteristic", fmt.Sprintf("%v", ots.Id)), map[string]string{})
+	var fiberCharInfo []fiberCore
+	json.Unmarshal([]byte(resp), &fiberCharInfo)
+	return fiberCharInfo
 }
 
 func nxPmConList(agent RestAgent) []map[string]interface{} {
@@ -40,7 +70,8 @@ func nxPmConList(agent RestAgent) []map[string]interface{} {
 		"startIndex":  0,
 	}
 	nxPmRawData := agent.HttpPostJson(url, payload, map[string]string{})
-	_, nxPmJsonData := GeneralJsonDecoder(nxPmRawData)
+	var nxPmJsonData []map[string]interface{}
+	json.Unmarshal([]byte(nxPmRawData), &nxPmJsonData)
 	return nxPmJsonData
 }
 
@@ -49,7 +80,7 @@ func timeCalculator() [2]int {
 	return [2]int{int(ts), int(ts) - 3600}
 }
 
-func getPortPower(agent RestAgent, portInfo []string, otsPmId string) (map[string]interface{}, bool) {
+func getPortPower(agent RestAgent, portInfo []string, otsPmId string) map[string]interface{} {
 	log.Printf("Retrieving the RX Power on %v\n", portInfo[0])
 	log.Printf("Retrieving the RX Power on %v\n", portInfo[1])
 	ts := timeCalculator()
@@ -65,18 +96,17 @@ func getPortPower(agent RestAgent, portInfo []string, otsPmId string) (map[strin
 		"fileLocation": "",
 	}
 	rawPmData := agent.HttpPostJson("/mncpm/connection/query", payload, map[string]string{})
-	jsonPmData, _ := GeneralJsonDecoder(rawPmData)
-	l1, ok := jsonPmData["objGraphDataMap"].([]interface{})[0].(map[string]interface{})["graphDataMap"].(map[string]interface{})["OPIN/TOPR-AVG (Receive/NEND)"]
-	if !ok {
+	var jsonPmData pmStruct
+	json.Unmarshal([]byte(rawPmData), &jsonPmData)
+	pmData := jsonPmData.ObjGraphDataMap[0].GraphDataMap.OPINTOPRAVGReceiveNEND.Pmdata
+	if len(pmData) == 0 {
 		log.Printf("error - PM Data not found for %v - %v", portInfo[0], portInfo[1])
-		return nil, ok
+		return nil
 	}
-	pmData := l1.(map[string]interface{})["pmdata"].([]interface{})
 	pmInfo := map[string]interface{}{}
 	for _, port := range portInfo {
 		t := map[string]string{}
-		for _, data_if := range pmData {
-			data := data_if.(map[string]interface{})
+		for _, data := range pmData {
 			if val, ok := data[port]; ok {
 				if val == "" {
 					continue
@@ -120,7 +150,7 @@ func getPortPower(agent RestAgent, portInfo []string, otsPmId string) (map[strin
 	}
 	log.Printf("Used the PM date at: %v UTC\n", pmInfo["Time"])
 	fmt.Println("#################################################################################")
-	return pmInfo, ok
+	return pmInfo
 }
 
 func exportFile(output [][]string) error {
@@ -153,33 +183,35 @@ func main() {
 	var wg1 sync.WaitGroup
 	var wg2 sync.WaitGroup
 
+	masterfile := []map[string]interface{}{}
+
 	restAgent := Init(ipaddr, uname, passw)
 	defer restAgent.NfmtDeauth()
 
 	otsList := GetRamanConnections(restAgent, ldType)
 
 	nxPm := nxPmConList(restAgent)
-	masterfile := []map[string]interface{}{}
+
 	for _, ots := range otsList {
 		wg2.Add(1)
-		go func(ots map[string]interface{}) {
+		go func(ots otsCon) {
 			var otsPmId map[string]interface{}
 			for _, item := range nxPm {
-				if item["cxnName"] == ots["guiLabel"] {
+				if item["cxnName"] == ots.GuiLabel {
 					otsPmId = item
 				}
 			}
 			chars := getFiberChar(restAgent, ots)
 			cores := []map[string]interface{}{}
-			pmData, ok := getPortPower(restAgent, []string{fmt.Sprintf("%v", ots["z2PortLabel"]), fmt.Sprintf("%v", ots["zPortLabel"])}, fmt.Sprintf("%v", otsPmId["cxnId"]))
-			if !ok {
+			pmData := getPortPower(restAgent, []string{fmt.Sprintf("%v", ots.Z2PortLabel), fmt.Sprintf("%v", ots.ZPortLabel)}, fmt.Sprintf("%v", otsPmId["cxnId"]))
+			if pmData == nil {
 				wg2.Done()
 				return
 			}
 			for _, core := range chars {
 				wg1.Add(1)
-				go func(core map[string]interface{}) {
-					corePowerData := map[string]interface{}{"egressPort": core["fromLabel"], "ingressPort": core["toLabel"], "egressPower": core["egressPowerOut"], "ingressPower": pmData[fmt.Sprintf("%v", core["toLabel"])], "ramanGain": core["targetGainStr"], "totalLoss": 0}
+				go func(core fiberCore) {
+					corePowerData := map[string]interface{}{"egressPort": core.FromLabel, "ingressPort": core.ToLabel, "egressPower": core.EgressPowerOut, "ingressPower": pmData[fmt.Sprintf("%v", core.ToLabel)], "ramanGain": core.RamanGain, "totalLoss": 0}
 					egPower, err := strconv.ParseFloat(fmt.Sprintf("%v", corePowerData["egressPower"]), 64)
 					errDealer(err)
 					inPower, err := strconv.ParseFloat(fmt.Sprintf("%v", corePowerData["ingressPower"]), 64)
@@ -192,6 +224,7 @@ func main() {
 						corePowerData["totalLoss"] = ((egPower - inPower) * 1000) / 1000
 					}
 					cores = append(cores, corePowerData)
+
 					wg1.Done()
 				}(core)
 			}
@@ -203,7 +236,7 @@ func main() {
 	wg2.Wait()
 	output := [][]string{{"OTS Name", "Egress Port", "Egress Power", "Ingress Port", "Ingress Power", "Raman Gain", "Total Loss"}}
 	for _, res := range masterfile {
-		index := fmt.Sprintf("%v", res["ots"].(map[string]interface{})["guiLabel"])
+		index := fmt.Sprintf("%v", res["ots"].(otsCon).GuiLabel)
 		for _, co := range res["cores"].([]map[string]interface{}) {
 			rowToAdd := []string{index, fmt.Sprintf("%v", co["egressPort"]), fmt.Sprintf("%v", co["egressPower"]), fmt.Sprintf("%v", co["ingressPort"]), fmt.Sprintf("%v", co["ingressPower"]), fmt.Sprintf("%v", co["ramanGain"]), fmt.Sprintf("%v", co["totalLoss"])}
 			output = append(output, rowToAdd)
@@ -215,10 +248,9 @@ func main() {
 	} else {
 		err := exportFile(output)
 		if err == nil {
-			fmt.Println("SUCCESS: Loss report file has been exported!")
+			log.Println("SUCCESS: Loss report file has been exported!")
 		} else {
 			panic(err)
 		}
 	}
-
 }
